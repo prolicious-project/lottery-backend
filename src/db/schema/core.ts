@@ -182,6 +182,10 @@ export const levelPools = pgTable('level_pools', {
 
   status: poolStatusEnum('status').notNull().default('filling'),
 
+  isClosed: boolean('is_closed').notNull().default(false),
+  
+  completedAt: timestamp('completed_at'),
+
   createdAt: timestamp('created_at').defaultNow(),
 });
 

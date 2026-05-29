@@ -7,55 +7,36 @@ export const adminOnly = (
   next: NextFunction
 ) => {
   if (!req.user) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized",
-    });
+    console.log("[adminOnly] REJECTED — no req.user");
+    return res.status(401).json({ success: false, message: "Unauthorized" });
   }
 
-  const role = String(req.user.role || "").toLowerCase();
+  // Debug: log what we received
+  console.log("[adminOnly] user:", JSON.stringify({
+    id: req.user.id,
+    role: req.user.role,
+    roleName: req.user.roleName,
+    _isAdminToken: req.user._isAdminToken,
+    hasPermissions: req.user.permissions !== undefined,
+  }));
 
-  // ✅ Allow any admin-type role
-  if (!role.includes("admin")) {
-    return res.status(403).json({
-      success: false,
-      message: "Access denied. Admins only",
-    });
+  // ✅ Primary: adminProtect sets this when admin_token cookie was used
+  if (req.user._isAdminToken === true) {
+    return next();
+  }
+
+  const role = String(req.user.role || req.user.roleName || "").toLowerCase();
+  const roleOk = role.includes("admin");
+  const hasAdminPermissions = req.user.permissions !== undefined && req.user.permissions !== null;
+
+  console.log("[adminOnly] roleOk:", roleOk, "| hasPermissions:", hasAdminPermissions);
+
+  if (!roleOk && !hasAdminPermissions) {
+    return res.status(403).json({ success: false, message: "Access denied. Admins only" });
   }
 
   next();
 };
 
-import jwt from "jsonwebtoken";
 
-
-
-export const protect = (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
-  const token = req.cookies?.token;
-
-  if (!token) {
-    return res.status(401).json({
-      success: false,
-      message: "Not authorized. Token missing",
-    });
-  }
-
-  try {
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET as string
-    );
-
-    req.user = decoded;
-    next();
-  } catch {
-    return res.status(401).json({
-      success: false,
-      message: "Invalid token",
-    });
-  }
-};
+

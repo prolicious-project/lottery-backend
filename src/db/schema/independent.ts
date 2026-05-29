@@ -1,5 +1,5 @@
 import {
-  pgTable, serial, varchar, boolean,
+  pgTable, serial, uuid, varchar, boolean,
   text, integer, jsonb, timestamp, pgEnum, numeric
 } from 'drizzle-orm/pg-core';
 
@@ -33,6 +33,7 @@ export const gameTypes = pgTable('game_types', {
   isActive: boolean('is_active').notNull().default(true),
   entryFee: numeric('entry_fee', { precision: 10, scale: 2 }).notNull().default('0'),
   commissionRate: numeric('commission_rate', { precision: 5, scale: 2 }).notNull().default('0.10'), // Default 10%
+  feeModel: varchar('fee_model', { length: 20 }).notNull().default('fixed'), // 'fixed' or 'variable'
   createdAt: timestamp('created_at').defaultNow(),
   type: gameTypeEnum('type').notNull(),
 });
@@ -88,4 +89,38 @@ export const adminRoles = pgTable('admin_roles', {
   name: varchar('name', { length: 100 }).notNull().unique(),
   permissions: jsonb('permissions').$type<string[]>().default([]),
   createdAt: timestamp('created_at').defaultNow(),
+});
+
+// ── Company Wallet Enums ──
+export const companyWalletTxnTypeEnum = pgEnum('company_wallet_txn_type', [
+  'deposit_credit',      // User deposits → Company Wallet += amount
+  'prize_payout_debit',  // Prize paid to winner → Company Wallet -= prize
+  'withdrawal_debit',    // Admin processes user withdrawal → Company Wallet -= amount (optional)
+]);
+
+// ── 9. company_wallet ──
+// Singleton row — always use slug='main' to upsert / select.
+// Do NOT insert more than one row; enforce at the application layer.
+export const companyWallet = pgTable('company_wallet', {
+  id:        uuid('id').primaryKey().defaultRandom(),
+  slug:      varchar('slug', { length: 20 }).notNull().unique().default('main'),
+  balance:   numeric('balance', { precision: 18, scale: 2 }).notNull().default('0'),
+  currency:  varchar('currency', { length: 5 }).notNull().default('INR'),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+// ── 10. company_wallet_transactions ──
+// Full ledger for every movement in/out of the company wallet.
+export const companyWalletTransactions = pgTable('company_wallet_transactions', {
+  id:              uuid('id').primaryKey().defaultRandom(),
+  /** Amount is always stored positive; direction is encoded in type */
+  amount:          numeric('amount', { precision: 15, scale: 2 }).notNull(),
+  type:            companyWalletTxnTypeEnum('type').notNull(),
+  /** Running company balance AFTER this transaction */
+  balanceAfter:    numeric('balance_after', { precision: 18, scale: 2 }).notNull(),
+  /** Reference to the user transaction that triggered this (optional) */
+  userTxnRef:      varchar('user_txn_ref', { length: 100 }),
+  /** Free-text description for audit trail */
+  note:            text('note'),
+  createdAt:       timestamp('created_at').defaultNow(),
 });

@@ -4,12 +4,37 @@ import { transactions, wallets, tickets, paymentOrders, users, paymentMethods } 
 import { sql, eq, and, desc } from "drizzle-orm";
 import Razorpay from "razorpay";
 import crypto from "crypto";
+import { updateCompanyWallet } from "../../utils/company-wallet.util";
+import { emitPaymentUpdate, emitAdminTransaction, emitAdminStatsUpdate } from "../../utils/socket";
 
 // Initialize Razorpay
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || "",
   key_secret: process.env.RAZORPAY_KEY_SECRET || "",
 });
+
+export const getOrCreateSystemUser = async (tx: any) => {
+  const email = "system-admin@lottery.internal";
+  let [user] = await tx.select().from(users).where(eq(users.email, email)).limit(1);
+  if (!user) {
+    const [newUser] = await tx.insert(users).values({
+      name: "System Admin",
+      email,
+      phone: "9999999999",
+      passwordHash: "N/A",
+      role: "admin",
+      status: "active",
+    }).returning();
+    user = newUser;
+
+    await tx.insert(wallets).values({
+      userId: user.id,
+      balance: "0.00",
+      lockedAmount: "0.00",
+    });
+  }
+  return user;
+};
 
 /**
  * @swagger
@@ -119,6 +144,7 @@ export const verifyRazorpayPayment = async (req: any, res: Response) => {
     console.log("Signature valid. Implementing instant fulfillment...");
 
     // 2. Fulfillment Logic (Mirroring Webhook for immediate UI feedback)
+    let amountToAddInRupees = 0;
     try {
       await db.transaction(async (tx) => {
         // [0] Idempotency Check & Secure Amount Fetch
@@ -133,7 +159,7 @@ export const verifyRazorpayPayment = async (req: any, res: Response) => {
         }
 
         const exactAmountInPaise = existingOrder[0].amount;
-        const amountToAddInRupees = Number((exactAmountInPaise / 100).toFixed(2));
+        amountToAddInRupees = Number((exactAmountInPaise / 100).toFixed(2));
 
         // [A] Update payment_orders
         await tx.update(paymentOrders)
@@ -149,39 +175,118 @@ export const verifyRazorpayPayment = async (req: any, res: Response) => {
           })
           .where(eq(transactions.txnRef, razorpay_order_id));
 
-        // [C] Credit Wallet ONLY FOR DEPOSITS (No drawId)
-        // If drawId is present, it's a ticket purchase, so we don't credit the wallet balance.
+        // [C] Credit Wallet / Company Wallet based on flow
         if (!drawId) {
-          let targetWalletId = walletId;
-          const userWallets = await tx.select().from(wallets).where(eq(wallets.userId, userId));
-          
-          if (userWallets.length > 0) {
-            targetWalletId = userWallets[0].id;
-            const currentBalance = Number(userWallets[0].balance) || 0;
-            const newBalance = currentBalance + amountToAddInRupees;
-            
-            await tx.update(wallets)
-              .set({
-                balance: newBalance.toFixed(2),
-                updatedAt: new Date(),
-              })
-              .where(eq(wallets.id, targetWalletId));
-            
-            console.log(`[Verify Success] DEPOSIT: Wallet ${targetWalletId} credited ₹${amountToAddInRupees}`);
+          const systemUser = await getOrCreateSystemUser(tx);
+          const isCompanyFunding = existingOrder[0].userId === systemUser.id;
+
+          if (isCompanyFunding) {
+            // Company Funding: Admin -> Razorpay -> Company Wallet
+            await updateCompanyWallet(
+              amountToAddInRupees,
+              "deposit_credit",
+              `Company funding verified via Razorpay: ${razorpay_payment_id}`,
+              razorpay_order_id,
+              tx
+            );
+            console.log(`[Verify] Company wallet funded ₹${amountToAddInRupees}`);
           } else {
-            console.log(`[Verify] Wallet missing for deposit. Creating for user ${userId}.`);
-            const [newWallet] = await tx.insert(wallets).values({
-              userId: userId,
-              balance: amountToAddInRupees.toFixed(2),
-              lockedAmount: "0.00"
-            }).returning({ id: wallets.id });
+            // User Deposit: User -> Razorpay -> User Wallet
+            let targetWalletId = walletId;
+            const userWallets = await tx.select().from(wallets).where(eq(wallets.userId, userId));
             
-            console.log(`[Verify Success] DEPOSIT: New Wallet ${newWallet.id} created and credited ₹${amountToAddInRupees}`);
+            if (userWallets.length > 0) {
+              targetWalletId = userWallets[0].id;
+              const currentBalance = Number(userWallets[0].balance) || 0;
+              const newBalance = currentBalance + amountToAddInRupees;
+              
+              await tx.update(wallets)
+                .set({
+                  balance: newBalance.toFixed(2),
+                  updatedAt: new Date(),
+                })
+                .where(eq(wallets.id, targetWalletId));
+              
+              console.log(`[Verify Success] DEPOSIT: Wallet ${targetWalletId} credited ₹${amountToAddInRupees}`);
+            } else {
+              console.log(`[Verify] Wallet missing for deposit. Creating for user ${userId}.`);
+              const [newWallet] = await tx.insert(wallets).values({
+                userId: userId,
+                balance: amountToAddInRupees.toFixed(2),
+                lockedAmount: "0.00"
+              }).returning({ id: wallets.id });
+              
+              console.log(`[Verify Success] DEPOSIT: New Wallet ${newWallet.id} created and credited ₹${amountToAddInRupees}`);
+            }
           }
         } else {
-          console.log(`[Verify Success] PURCHASE: Ticket(s) issued for Draw ${drawId}. No wallet credit needed.`);
+          // Ticket Purchase directly via Razorpay: User Wallet -> Company Wallet (conceptually)
+          await updateCompanyWallet(
+            amountToAddInRupees,
+            "deposit_credit",
+            `Ticket purchase verified via Razorpay: ${razorpay_payment_id} for Draw ${drawId}`,
+            razorpay_order_id,
+            tx
+          );
+          console.log(`[Verify Success] PURCHASE: Ticket(s) issued for Draw ${drawId}. Company wallet credited ₹${amountToAddInRupees}`);
         }
       });
+
+      // Socket.io real-time update
+      try {
+        const [updatedWallet] = await db.select().from(wallets).where(eq(wallets.userId, userId)).limit(1);
+        if (updatedWallet) {
+          emitPaymentUpdate(userId, {
+            status: "success",
+            amount: amountToAddInRupees,
+            available: Number(updatedWallet.balance),
+            note: `Verified: Frontend signature proven — ${razorpay_payment_id}`
+          });
+        }
+
+        const [newTxn] = await db.select().from(transactions).where(eq(transactions.txnRef, razorpay_order_id)).limit(1);
+        if (newTxn) {
+          const typeMapping: Record<string, string> = {
+            deposit: "Deposit",
+            withdrawal: "Withdrawal",
+            ticket_purchase: "TicketPurchase",
+            prize_payout: "PrizePayout",
+          };
+          const statusMapping: Record<string, string> = {
+            pending: "Pending",
+            success: "Success",
+            failed: "Failed",
+          };
+          const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+          emitAdminTransaction({
+            id: newTxn.id,
+            userName: user?.name || "Unknown User",
+            amount: newTxn.amount,
+            type: typeMapping[newTxn.type] || newTxn.type,
+            status: statusMapping[newTxn.status] || newTxn.status,
+            method: "Razorpay",
+            datetime: newTxn.createdAt || new Date(),
+          });
+        }
+
+        const stats = await db.select({
+          totalRevenue: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'ticket_purchase' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+          totalDeposits: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'deposit' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+          totalWithdrawals: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'withdrawal' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+          totalPending: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.status} = 'pending' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        }).from(transactions);
+
+        if (stats.length > 0) {
+          emitAdminStatsUpdate({
+            totalRevenue: Number(stats[0].totalRevenue) || 0,
+            totalDeposits: Number(stats[0].totalDeposits) || 0,
+            totalWithdrawals: Number(stats[0].totalWithdrawals) || 0,
+            totalPending: Number(stats[0].totalPending) || 0,
+          });
+        }
+      } catch (err: any) {
+        console.error("[Verify Socket Event Error]:", err.message);
+      }
 
       return res.status(200).json({
         success: true,
@@ -534,6 +639,7 @@ export const handleRazorpayWebhook = async (req: Request, res: Response) => {
   console.log(`[Webhook] Found both payment_order ${pOrder.id} and transaction ${txn.id}`);
 
   // ── Step 10: Atomically update DB state ───────────────
+  let amountInRupees = "0.00";
   try {
     await db.transaction(async (tx) => {
 
@@ -558,22 +664,95 @@ export const handleRazorpayWebhook = async (req: Request, res: Response) => {
 
       console.log(`[Webhook] Transaction ${txn.id} updated to "success"`);
 
-      // Update wallet balance: wallet.balance += amount
+      // Update wallet balance / company wallet based on flow
       // Razorpay sends amount in paise — convert to INR rupees (÷100)
-      const amountInRupees = (amountInPaise / 100).toFixed(2);
+      amountInRupees = (amountInPaise / 100).toFixed(2);
+      const systemUser = await getOrCreateSystemUser(tx);
+      const isCompanyFunding = pOrder.userId === systemUser.id;
 
-      await tx
-        .update(wallets)
-        .set({
-          balance: sql`${wallets.balance}::numeric + ${amountInRupees}::numeric`,
-          updatedAt: new Date(),
-        })
-        .where(eq(wallets.id, txn.walletId));
+      if (isCompanyFunding) {
+        // Company Funding: Admin -> Razorpay -> Company Wallet
+        await updateCompanyWallet(
+          Number(amountInRupees),
+          "deposit_credit",
+          `Company funding captured via Razorpay webhook: ${razorpayPaymentId}`,
+          razorpayOrderId,
+          tx
+        );
+        console.log(`[Webhook] Company wallet funded ₹${amountInRupees}`);
+      } else {
+        // User Deposit: User -> Razorpay -> User Wallet
+        await tx
+          .update(wallets)
+          .set({
+            balance: sql`${wallets.balance}::numeric + ${amountInRupees}::numeric`,
+            updatedAt: new Date(),
+          })
+          .where(eq(wallets.id, txn.walletId));
 
-      console.log(`[Webhook] Wallet ${txn.walletId} credited ₹${amountInRupees}`);
+        console.log(`[Webhook] Wallet ${txn.walletId} credited ₹${amountInRupees}`);
+      }
     });
 
     console.log(`[Webhook] ✅ payment.captured processed for order ${razorpayOrderId}`);
+
+    // Socket.io real-time update
+    try {
+      const userId = pOrder.userId;
+      const [updatedWallet] = await db.select().from(wallets).where(eq(wallets.userId, userId)).limit(1);
+      if (updatedWallet) {
+        emitPaymentUpdate(userId, {
+          status: "success",
+          amount: Number(amountInRupees),
+          available: Number(updatedWallet.balance),
+          note: `Webhook: payment.captured — ${razorpayPaymentId}`
+        });
+      }
+
+      const [newTxn] = await db.select().from(transactions).where(eq(transactions.txnRef, razorpayOrderId)).limit(1);
+      if (newTxn) {
+        const typeMapping: Record<string, string> = {
+          deposit: "Deposit",
+          withdrawal: "Withdrawal",
+          ticket_purchase: "TicketPurchase",
+          prize_payout: "PrizePayout",
+        };
+        const statusMapping: Record<string, string> = {
+          pending: "Pending",
+          success: "Success",
+          failed: "Failed",
+        };
+        const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+        emitAdminTransaction({
+          id: newTxn.id,
+          userName: user?.name || "Unknown User",
+          amount: newTxn.amount,
+          type: typeMapping[newTxn.type] || newTxn.type,
+          status: statusMapping[newTxn.status] || newTxn.status,
+          method: "Razorpay Webhook",
+          datetime: newTxn.createdAt || new Date(),
+        });
+      }
+
+      const stats = await db.select({
+        totalRevenue: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'ticket_purchase' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalDeposits: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'deposit' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalWithdrawals: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'withdrawal' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalPending: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.status} = 'pending' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+      }).from(transactions);
+
+      if (stats.length > 0) {
+        emitAdminStatsUpdate({
+          totalRevenue: Number(stats[0].totalRevenue) || 0,
+          totalDeposits: Number(stats[0].totalDeposits) || 0,
+          totalWithdrawals: Number(stats[0].totalWithdrawals) || 0,
+          totalPending: Number(stats[0].totalPending) || 0,
+        });
+      }
+    } catch (err: any) {
+      console.error("[Webhook Socket Event Error]:", err.message);
+    }
+
     return res.status(200).json({ message: "Webhook processed successfully" });
 
   } catch (dbError: any) {
@@ -652,6 +831,69 @@ export const updateWalletBalance = async (
 
       return { success: true, message: "Wallet balance securely updated." };
     });
+
+    // After transaction succeeds, emit socket.io update
+    try {
+      const [updatedWallet] = await db.select().from(wallets).where(eq(wallets.userId, userId)).limit(1);
+      if (updatedWallet) {
+        emitPaymentUpdate(userId, {
+          status: "success",
+          amount: Math.abs(amount),
+          available: Number(updatedWallet.balance),
+          note: `Internal wallet update: ${type}`
+        });
+      }
+
+      // Query the transaction just inserted to broadcast to admin
+      const [newTxn] = await db.select().from(transactions).where(and(eq(transactions.userId, userId), eq(transactions.type, type))).orderBy(desc(transactions.createdAt)).limit(1);
+      if (newTxn) {
+        const typeMapping: Record<string, string> = {
+          deposit: "Deposit",
+          withdrawal: "Withdrawal",
+          ticket_purchase: "TicketPurchase",
+          prize_payout: "PrizePayout",
+          bonus_credit: "BonusCredit",
+          referral_reward: "ReferralReward",
+          manual_adjustment: "ManualAdjustment",
+        };
+        const statusMapping: Record<string, string> = {
+          pending: "Pending",
+          success: "Success",
+          failed: "Failed",
+        };
+        const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+        emitAdminTransaction({
+          id: newTxn.id,
+          userName: user?.name || "Unknown User",
+          amount: newTxn.amount,
+          type: typeMapping[newTxn.type] || newTxn.type,
+          status: statusMapping[newTxn.status] || newTxn.status,
+          method: "Wallet/Gateway",
+          datetime: newTxn.createdAt || new Date(),
+        });
+      }
+
+      // Update admin stats
+      const stats = await db.select({
+        totalRevenue: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'ticket_purchase' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalDeposits: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'deposit' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalWithdrawals: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'withdrawal' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalPending: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.status} = 'pending' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+      }).from(transactions);
+
+      if (stats.length > 0) {
+        emitAdminStatsUpdate({
+          totalRevenue: Number(stats[0].totalRevenue) || 0,
+          totalDeposits: Number(stats[0].totalDeposits) || 0,
+          totalWithdrawals: Number(stats[0].totalWithdrawals) || 0,
+          totalPending: Number(stats[0].totalPending) || 0,
+        });
+      }
+    } catch (err: any) {
+      console.error("[Wallet Update Socket Event Error]:", err.message);
+    }
+
+    return { success: true, message: "Wallet balance securely updated." };
   } catch (error: any) {
     console.error("[Wallet Utility] Failed to update balance:", error.message);
     return { success: false, error: error.message };
