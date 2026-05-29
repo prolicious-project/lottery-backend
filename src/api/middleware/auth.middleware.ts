@@ -44,3 +44,40 @@ export const protect = (
     });
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// adminProtect — use this instead of protect() on ALL admin routes.
+// Checks admin_token FIRST so it is never shadowed by a regular user token
+// when both cookies are present in the same browser session.
+// ─────────────────────────────────────────────────────────────────────────────
+export const adminProtect = (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  // admin_token takes priority for admin routes
+  const adminToken = req.cookies?.admin_token;
+  const userToken = req.cookies?.token;
+  const token = adminToken || userToken;
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: "Not authorized. Admin token missing",
+    });
+  }
+
+  try {
+    const decoded: any = jwt.verify(token, process.env.JWT_SECRET as string);
+    req.user = decoded;
+    // ✅ Tag whether we authenticated via admin_token cookie
+    // adminOnly reads this flag — no role string matching needed
+    req.user._isAdminToken = !!adminToken;
+    next();
+  } catch {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired admin token",
+    });
+  }
+};

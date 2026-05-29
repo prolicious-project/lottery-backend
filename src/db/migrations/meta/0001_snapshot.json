@@ -1,6 +1,6 @@
 {
-  "id": "6f0b0955-a7d2-427a-be7b-8ee09157ccb2",
-  "prevId": "00000000-0000-0000-0000-000000000000",
+  "id": "7896be7c-4e1f-4f3f-a9d0-f6c3518c8b22",
+  "prevId": "6f0b0955-a7d2-427a-be7b-8ee09157ccb2",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -151,6 +151,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'0.10'"
+        },
+        "fee_model": {
+          "name": "fee_model",
+          "type": "varchar(20)",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'fixed'"
         },
         "created_at": {
           "name": "created_at",
@@ -1002,6 +1009,19 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'filling'"
+        },
+        "is_closed": {
+          "name": "is_closed",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "completed_at": {
+          "name": "completed_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": false
         },
         "created_at": {
           "name": "created_at",

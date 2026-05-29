@@ -6,7 +6,7 @@ import {
   handleRazorpayWebhook,
   getAdminTransactions,
 } from "../controllers/payment.controller";
-import { protect } from "../middleware/auth.middleware";
+import { protect, adminProtect } from "../middleware/auth.middleware";
 import { adminOnly } from "../middleware/admin.middleware";
 
 /**
@@ -47,13 +47,13 @@ router.post(
  * GET /api/payments/stats
  * Admin only stats for the dashboard.
  */
-router.get("/stats", protect, adminOnly, getPaymentStats);
+router.get("/stats", adminProtect, adminOnly, getPaymentStats);
 
 /**
  * GET /api/payments/transactions
  * Admin only transaction history.
  */
-router.get("/transactions", protect, adminOnly, getAdminTransactions);
+router.get("/transactions", adminProtect, adminOnly, getAdminTransactions);
 
 /**
  * POST /api/payments/create-order

@@ -5,15 +5,17 @@ import {
   createAdminRole,
   getAdminProfile,
 } from "../controllers/admin.controller";
-import { protect } from "../middleware/auth.middleware";
+import { adjustUserWallet } from "../controllers/wallet.controller";
+import { protect, adminProtect } from "../middleware/auth.middleware";
 import { adminOnly } from "../middleware/admin.middleware";
 const router = express.Router();
 /* PUBLIC */
 router.post("/admin-login", adminLogin);
 /* PROTECTED ADMIN ROUTES */
-router.post("/roles", protect, adminOnly, createAdminRole);
+router.post("/roles", adminProtect, adminOnly, createAdminRole);
 router.post("/create", createAdmin);
-router.get("/me", protect, adminOnly, getAdminProfile);
+router.get("/me", adminProtect, adminOnly, getAdminProfile);
+router.post("/wallet/adjust", adminProtect, adminOnly, adjustUserWallet);
 
 export default router;
 

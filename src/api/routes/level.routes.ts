@@ -54,7 +54,7 @@ router.post("/levels/join", protect, joinLevel);
  *     summary: Return user entries
  *     tags: [Level Game]
  */
-router.get("/levels/my-entries", getMyEntries);
+router.get("/levels/my-entries", protect, getMyEntries);
 
 // Wallet routes removed from level.routes.ts (these are handled in wallet.routes.ts)
 

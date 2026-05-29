@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
+import { createServer } from "http";
+import { initSocket } from "./utils/socket";
 
 // Swagger
 import swaggerJsdoc from "swagger-jsdoc";
@@ -18,6 +20,7 @@ import referralRoutes from "./api/routes/referral.routes";
 import ticketRoutes from "./api/routes/ticket.routes";
 import levelRoutes from "./api/routes/level.routes";
 import walletRoutes from "./api/routes/wallet.routes";
+import companyWalletRoutes from "./api/routes/company-wallet.routes";
 
 dotenv.config();
 
@@ -77,16 +80,24 @@ app.use("/api", levelRoutes);
 
 app.use("/api/payments", paymentRoutes);
 app.use("/api/auth", authRoutes);
-app.use("/api/admin", adminRoutes);
 app.use("/api/referral", referralRoutes);
 app.use("/api/tickets", ticketRoutes);
 
 // ✅ WALLET ROUTES
 app.use("/api/wallet", walletRoutes);
 
+// ✅ COMPANY WALLET — registered BEFORE /api/admin to prevent route shadowing
+app.use("/api/admin/company-wallet", companyWalletRoutes);
+
+// ✅ ADMIN ROUTES
+app.use("/api/admin", adminRoutes);
 
 const PORT = process.env.PORT || 10000;
 
-app.listen(PORT, () => {
+const httpServer = createServer(app);
+const io = initSocket(httpServer);
+app.set("io", io);
+
+httpServer.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });

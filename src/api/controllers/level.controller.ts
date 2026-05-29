@@ -1,7 +1,11 @@
 import { Request, Response } from "express";
 import { db } from "../../db";
-import { gameTypes, levelPools, levelEntries, wallets, withdrawals, users } from "../../db/schema";
+import { gameTypes, levelPools, levelEntries, wallets, withdrawals, users, transactions } from "../../db/schema";
 import { eq, and, sql, desc } from "drizzle-orm";
+import crypto from "crypto";
+import { sendEmailNotification, sendSMSNotification } from "../../utils/notification.util";
+import { updateCompanyWallet } from "../../utils/company-wallet.util";
+import { emitPaymentUpdate, emitAdminTransaction, emitAdminStatsUpdate } from "../../utils/socket";
 
 /**
  * Helper to get the current user ID for testing/seamless integration.
@@ -13,6 +17,111 @@ const getUserId = async (providedUserId?: any) => {
   if (providedUserId && providedUserId !== 'undefined' && typeof providedUserId === 'string') return providedUserId;
   const [firstUser] = await db.select().from(users).limit(1);
   return firstUser?.id;
+};
+
+const processLevelCompletionPayouts = async (tx: any, poolData: any, payoutUsers?: string[]) => {
+  const completedLevel = poolData.pool.level;
+
+  const payUser = async (entry: any, note: string, updateStatusToPaid: boolean) => {
+    const payoutAmount = Number(entry.amountPaid) * 2;
+    if (payoutUsers) payoutUsers.push(entry.userId);
+    const [userWallet] = await tx.select().from(wallets).where(eq(wallets.userId, entry.userId));
+    if (userWallet) {
+      const newBalance = (Number(userWallet.balance) + payoutAmount).toString();
+      await tx.update(wallets).set({ balance: newBalance }).where(eq(wallets.id, userWallet.id));
+
+      if (updateStatusToPaid) {
+        await tx.update(levelEntries)
+          .set({ status: 'paid' })
+          .where(eq(levelEntries.id, entry.id));
+      }
+
+      const txnRef = `PAYOUT-${crypto.randomBytes(8).toString("hex").toUpperCase()}`;
+
+      await tx.insert(transactions).values({
+        userId: entry.userId,
+        walletId: userWallet.id,
+        txnRef,
+        amount: payoutAmount.toString(),
+        type: "prize_payout",
+        status: "success",
+        note: note,
+      });
+
+      // ── COMPANY WALLET: Prize payout debit (inside same tx) ────────────
+      // FLOW: Prize Payout → Company Wallet -= prize; Winner Wallet += prize
+      await updateCompanyWallet(
+        payoutAmount,
+        "prize_payout_debit",
+        `Prize payout to user ${entry.userId}: ${note}`,
+        txnRef,
+        tx
+      );
+
+      const [userObj] = await tx.select().from(users).where(eq(users.id, entry.userId));
+      if (userObj) {
+        if (userObj.email) {
+          await sendEmailNotification(
+            userObj.email,
+            "Payout Received! 🎊",
+            `<p>Congratulations ${userObj.name}!</p><p>You have received a payout of <b>₹${payoutAmount}</b>. ${note}</p>`
+          );
+        }
+        if (userObj.phone) {
+          await sendSMSNotification(
+            userObj.phone,
+            `Congratulations ${userObj.name}! You received a payout of ₹${payoutAmount}. Check your wallet.`
+          );
+        }
+      }
+    }
+  };
+
+  // 1. Standard Payout: Level n completes -> Pay participants in Level n-1
+  const prevLevel = completedLevel - 1;
+  if (prevLevel >= 0) {
+    const prevEntries = await tx.select()
+      .from(levelEntries)
+      .where(
+        and(
+          eq(levelEntries.gameTypeId, poolData.game.id),
+          eq(levelEntries.level, prevLevel),
+          eq(levelEntries.status, 'active')
+        )
+      );
+
+    for (const entry of prevEntries) {
+      await payUser(entry, `Level Game Payout: Level ${prevLevel} Completed`, true);
+    }
+  }
+
+  // 2. Incremental Payouts (Levels 5 through 11)
+  if (completedLevel >= 6 && completedLevel <= 11) {
+    for (let l = 5; l <= completedLevel - 2; l++) {
+      const entries = await tx.select()
+        .from(levelEntries)
+        .where(
+          and(
+            eq(levelEntries.gameTypeId, poolData.game.id),
+            eq(levelEntries.level, l)
+          )
+        );
+
+      for (const entry of entries) {
+        const incNote = `Incremental Reward: Level ${l} participant paid for Level ${completedLevel} completion`;
+        const [existingTx] = await tx.select().from(transactions).where(
+          and(
+            eq(transactions.userId, entry.userId),
+            eq(transactions.note, incNote)
+          )
+        ).limit(1);
+
+        if (!existingTx) {
+          await payUser(entry, incNote, false);
+        }
+      }
+    }
+  }
 };
 
 /* ================= USER ENDPOINTS ================= */
@@ -48,22 +157,20 @@ export const getActiveLevels = async (req: Request, res: Response) => {
     })
       .from(levelPools)
       .innerJoin(gameTypes, eq(levelPools.gameTypeId, gameTypes.id))
-      .where(and(
-        eq(levelPools.gameTypeId, Number(levelGameId)),
-        eq(levelPools.status, 'filling')
-      ));
+      .where(eq(levelPools.gameTypeId, Number(levelGameId)))
+      .orderBy(desc(levelPools.id));
 
     const formattedPools = pools.map(p => {
-      // NEW LOGIC: Registration fee for every level is now the same as the base entry fee.
-      // We no longer multiply the fee by the level number.
-      const entryFee = Number(p.entryFee);
+      // Calculate entry fee based on fee model
+      let entryFee = Number(p.entryFee);
+      // Ensure we treat p.feeModel carefully, defaulting to fixed if not present
+      if ((p as any).feeModel === 'variable') {
+        entryFee = entryFee * Math.max(1, p.level);
+      }
 
       return {
         ...p,
-        // The display fee remains fixed for all levels
         entryFee: entryFee.toString(),
-        // NEW LOGIC: The reward (prize) is always exactly DOUBLE the registration fee.
-        // For example, if entry is 10, the reward is 20.
         reward: entryFee * 2
       };
     });
@@ -77,16 +184,18 @@ export const getActiveLevels = async (req: Request, res: Response) => {
 
 // POST /api/levels/join
 export const joinLevel = async (req: Request, res: Response) => {
+  let entryFee = 0;
+  const payoutUsers: string[] = [];
   try {
     const { poolId } = req.body;
-    
+
     // Authenticated user extraction via `protect` middleware
     const user = (req as any).user;
     let userId = user?.id;
 
     // Fallback solely to support tests directly hitting controller
     if (!userId) {
-       userId = await getUserId(req.body.userId);
+      userId = await getUserId(req.body.userId);
     }
 
     if (!poolId || !userId) return res.status(400).json({ error: "Could not identify user or pool" });
@@ -111,8 +220,7 @@ export const joinLevel = async (req: Request, res: Response) => {
           .where(
             and(
               eq(levelPools.gameTypeId, gameId),
-              eq(levelPools.level, levelNum),
-              eq(levelPools.status, 'filling')
+              eq(levelPools.level, levelNum)
             )
           )
           .limit(1);
@@ -151,13 +259,32 @@ export const joinLevel = async (req: Request, res: Response) => {
         .innerJoin(gameTypes, eq(levelPools.gameTypeId, gameTypes.id))
         .where(eq(levelPools.id, actualPoolId));
 
-      if (!pool || pool.pool.status !== 'filling') {
+      if (!pool || pool.pool.status !== 'filling' || pool.pool.isClosed) {
         throw new Error("Pool is not available for joining");
       }
 
-      // NEW LOGIC: Every level requires the same fixed registration fee.
-      // We use the base entry fee from the game configuration without multiplying by the level.
-      const entryFee = Number(pool.game.entryFee);
+      // Check for One Entry Per User Per Level constraint
+      const [existingEntry] = await tx.select()
+        .from(levelEntries)
+        .where(
+          and(
+            eq(levelEntries.userId, userId),
+            eq(levelEntries.gameTypeId, pool.game.id),
+            eq(levelEntries.level, pool.pool.level),
+            eq(levelEntries.status, 'active') // Or whatever defines a valid paid entry
+          )
+        )
+        .limit(1);
+
+      if (existingEntry) {
+        throw new Error("User can join a specific level only once");
+      }
+
+      // Calculate entry fee
+      entryFee = Number(pool.game.entryFee);
+      if (pool.game.feeModel === 'variable') {
+        entryFee = entryFee * Math.max(1, pool.pool.level);
+      }
 
       const [wallet] = await tx.select().from(wallets).where(eq(wallets.userId, userId));
       if (!wallet || Number(wallet.balance) < entryFee) {
@@ -166,6 +293,27 @@ export const joinLevel = async (req: Request, res: Response) => {
 
       const newBalance = (Number(wallet.balance) - entryFee).toString();
       await tx.update(wallets).set({ balance: newBalance }).where(eq(wallets.id, wallet.id));
+
+      const txnRef = `LVL-${crypto.randomBytes(8).toString("hex").toUpperCase()}`;
+      await tx.insert(transactions).values({
+        userId,
+        walletId: wallet.id,
+        txnRef,
+        amount: entryFee.toString(),
+        type: "ticket_purchase",
+        status: "success",
+        note: `Level Join: Pool ${pool.pool.id} (Level ${pool.pool.level})`,
+      });
+
+      // ── COMPANY WALLET: Level entry credit (runs inside same tx) ──
+      // FLOW: User Wallet -> Company Wallet
+      await updateCompanyWallet(
+        entryFee,
+        "deposit_credit",
+        `Level Join: User ${userId} joined pool ${pool.pool.id} (Level ${pool.pool.level})`,
+        txnRef,
+        tx
+      );
 
       await tx.insert(levelEntries).values({
         userId,
@@ -180,9 +328,89 @@ export const joinLevel = async (req: Request, res: Response) => {
       await tx.update(levelPools).set({ currentCount: newCount }).where(eq(levelPools.id, pool.pool.id));
 
       if (newCount >= pool.pool.requiredCount) {
-        await tx.update(levelPools).set({ status: 'completed' }).where(eq(levelPools.id, pool.pool.id));
+        await tx.update(levelPools)
+          .set({
+            status: 'completed',
+            isClosed: true,
+            completedAt: new Date()
+          })
+          .where(eq(levelPools.id, pool.pool.id));
+
+        // Process payouts using the helper
+        await processLevelCompletionPayouts(tx, pool, payoutUsers);
       }
     });
+
+    // Socket.io real-time update for joiner
+    try {
+      const [updatedWallet] = await db.select().from(wallets).where(eq(wallets.userId, userId)).limit(1);
+      if (updatedWallet) {
+        emitPaymentUpdate(userId, {
+          status: "success",
+          amount: entryFee,
+          available: Number(updatedWallet.balance),
+          note: `Level Join: Pool ${poolId} (Level)`
+        });
+      }
+
+      // Socket.io real-time updates for payout users
+      for (const pUserId of payoutUsers) {
+        const [pWallet] = await db.select().from(wallets).where(eq(wallets.userId, pUserId)).limit(1);
+        if (pWallet) {
+          emitPaymentUpdate(pUserId, {
+            status: "success",
+            amount: entryFee * 2, // payouts are entryFee * 2
+            available: Number(pWallet.balance),
+            note: "Level Game Payout"
+          });
+        }
+      }
+
+      // Emit live transaction and stats to admins
+      const [newTxn] = await db.select().from(transactions).where(and(eq(transactions.userId, userId), eq(transactions.type, "ticket_purchase"))).orderBy(desc(transactions.createdAt)).limit(1);
+      if (newTxn) {
+        const typeMapping: Record<string, string> = {
+          deposit: "Deposit",
+          withdrawal: "Withdrawal",
+          ticket_purchase: "TicketPurchase",
+          prize_payout: "PrizePayout",
+        };
+        const statusMapping: Record<string, string> = {
+          pending: "Pending",
+          success: "Success",
+          failed: "Failed",
+        };
+        const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+        emitAdminTransaction({
+          id: newTxn.id,
+          userName: user?.name || "Unknown User",
+          amount: newTxn.amount,
+          type: typeMapping[newTxn.type] || newTxn.type,
+          status: statusMapping[newTxn.status] || newTxn.status,
+          method: "Wallet",
+          datetime: newTxn.createdAt || new Date(),
+        });
+      }
+
+      // Emit updated stats to admins
+      const stats = await db.select({
+        totalRevenue: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'ticket_purchase' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalDeposits: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'deposit' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalWithdrawals: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'withdrawal' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalPending: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.status} = 'pending' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+      }).from(transactions);
+
+      if (stats.length > 0) {
+        emitAdminStatsUpdate({
+          totalRevenue: Number(stats[0].totalRevenue) || 0,
+          totalDeposits: Number(stats[0].totalDeposits) || 0,
+          totalWithdrawals: Number(stats[0].totalWithdrawals) || 0,
+          totalPending: Number(stats[0].totalPending) || 0,
+        });
+      }
+    } catch (err: any) {
+      console.error("[Join Level Socket Event Error]:", err.message);
+    }
 
     res.json({ success: true, message: "Joined pool successfully" });
   } catch (error: any) {
@@ -194,7 +422,13 @@ export const joinLevel = async (req: Request, res: Response) => {
 // GET /api/levels/my-entries
 export const getMyEntries = async (req: Request, res: Response) => {
   try {
-    const userId = await getUserId(req.query.userId);
+    const user = (req as any).user;
+    let userId = user?.id;
+
+    if (!userId) {
+      userId = await getUserId(req.query.userId);
+    }
+
     if (!userId) return res.status(400).json({ error: "Could not identify user" });
 
     const entries = await db.select({
@@ -203,7 +437,8 @@ export const getMyEntries = async (req: Request, res: Response) => {
       amount: levelEntries.amountPaid,
       createdAt: levelEntries.createdAt,
       status: levelEntries.status,
-      gameName: gameTypes.name
+      gameName: gameTypes.name,
+      gameId: gameTypes.id
     })
       .from(levelEntries)
       .innerJoin(gameTypes, eq(levelEntries.gameTypeId, gameTypes.id))
@@ -259,6 +494,38 @@ export const withdraw = async (req: Request, res: Response) => {
       });
     });
 
+    // Socket.io real-time update
+    try {
+      const [updatedWallet] = await db.select().from(wallets).where(eq(wallets.userId, userId)).limit(1);
+      if (updatedWallet) {
+        emitPaymentUpdate(userId, {
+          status: "pending",
+          amount: Number(amount),
+          available: Number(updatedWallet.balance),
+          note: "Withdrawal request submitted"
+        });
+      }
+
+      // Emit updated stats (pending amount changes)
+      const stats = await db.select({
+        totalRevenue: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'ticket_purchase' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalDeposits: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'deposit' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalWithdrawals: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'withdrawal' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalPending: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.status} = 'pending' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+      }).from(transactions);
+
+      if (stats.length > 0) {
+        emitAdminStatsUpdate({
+          totalRevenue: Number(stats[0].totalRevenue) || 0,
+          totalDeposits: Number(stats[0].totalDeposits) || 0,
+          totalWithdrawals: Number(stats[0].totalWithdrawals) || 0,
+          totalPending: Number(stats[0].totalPending) || 0,
+        });
+      }
+    } catch (err: any) {
+      console.error("[Withdraw Socket Event Error]:", err.message);
+    }
+
     res.json({ success: true, message: "Withdrawal request submitted" });
   } catch (error: any) {
     console.error("Withdraw error:", error.message);
@@ -289,12 +556,13 @@ export const createLevelGame = async (req: Request, res: Response) => {
       description: description || "Level-based game",
       icon: icon || "🎮",
       type: 'level',
+      feeModel: req.body.feeModel || 'fixed',
       isActive: true
     }).returning();
 
     await db.insert(levelPools).values({
       gameTypeId: newGame.id,
-      level: 1,
+      level: 0,
       requiredCount: 4,
       status: 'filling'
     });
@@ -367,11 +635,10 @@ export const createAdminLevel = async (req: Request, res: Response) => {
   try {
     const { gameTypeId, level, requiredCount } = req.body;
 
-    // Insert into DB
     const [result] = await db.insert(levelPools).values({
       gameTypeId: Number(gameTypeId),
       level: Number(level),
-      requiredCount: Number(requiredCount),
+      requiredCount: 4,
       currentCount: 0,
       status: 'filling'
     }).returning();
@@ -387,7 +654,30 @@ export const createAdminLevel = async (req: Request, res: Response) => {
 export const forceCompletePool = async (req: Request, res: Response) => {
   try {
     const { poolId } = req.body;
-    await db.update(levelPools).set({ status: 'completed' }).where(eq(levelPools.id, poolId));
+
+    await db.transaction(async (tx) => {
+      const [poolData] = await tx.select({
+        pool: levelPools,
+        game: gameTypes
+      })
+        .from(levelPools)
+        .innerJoin(gameTypes, eq(levelPools.gameTypeId, gameTypes.id))
+        .where(eq(levelPools.id, poolId));
+
+      if (!poolData) throw new Error("Pool not found");
+
+      await tx.update(levelPools)
+        .set({
+          status: 'completed',
+          isClosed: true,
+          completedAt: new Date()
+        })
+        .where(eq(levelPools.id, poolId));
+
+      // Process payouts using the helper
+      await processLevelCompletionPayouts(tx, poolData);
+    });
+
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: "Failed to force complete pool" });

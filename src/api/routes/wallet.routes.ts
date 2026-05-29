@@ -6,13 +6,13 @@ import {
   payWithWallet
 } from "../controllers/wallet.controller";
 
-import { protect } from "../middleware/auth.middleware";
+import { protect, adminProtect } from "../middleware/auth.middleware";
 import { adminOnly } from "../middleware/admin.middleware";
 
 const router = express.Router();
 
 // ADMIN
-router.get("/admin/all", protect, adminOnly, getAllWallets);
+router.get("/admin/all", adminProtect, adminOnly, getAllWallets);
 
 // USER WALLET
 router.get("/", protect, getUserWallet);

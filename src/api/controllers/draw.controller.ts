@@ -1,8 +1,10 @@
 import { Request, Response } from "express";
 import { db } from "../../db/index";
-import { draws, gameTypes, tickets, drawResults, drawWinners, wallets } from "../../db/schema";
+import { draws, gameTypes, tickets, drawResults, drawWinners, wallets, users, transactions } from "../../db/schema";
 import { eq, desc, inArray, and, sql } from "drizzle-orm";
 import { drawStatusEnum } from "../../db/schema";
+import { sendEmailNotification } from "../../utils/notification.util";
+import { emitPaymentUpdate, emitAdminTransaction, emitAdminStatsUpdate } from "../../utils/socket";
 
 /**
  * @swagger
@@ -334,6 +336,7 @@ export const declareResult = async (req: Request, res: Response) => {
   }
 
   try {
+    const winnersToEmit: { userId: string; prize: number }[] = [];
     await db.transaction(async (tx) => {
       // 1. Fetch draw and guard against double-declaration
       const [draw] = await tx.select().from(draws).where(eq(draws.id, drawId)).limit(1);
@@ -382,8 +385,81 @@ export const declareResult = async (req: Request, res: Response) => {
           .update(wallets)
           .set({ balance: sql`${wallets.balance}::numeric + ${prizePerWinner}::numeric` })
           .where(eq(wallets.userId, t.userId));
+
+        winnersToEmit.push({ userId: t.userId, prize: Number(prizePerWinner) });
+
+        const [userObj] = await tx.select().from(users).where(eq(users.id, t.userId));
+        if (userObj && userObj.email) {
+          await sendEmailNotification(
+            userObj.email,
+            "Congratulations! You Won the Draw! 🎉",
+            `<p>Hi ${userObj.name},</p><p>You won <b>₹${prizePerWinner}</b> in the latest draw. The payout has been credited to your wallet.</p>`
+          );
+        }
       }
     });
+
+    // Socket.io real-time update
+    try {
+      for (const winner of winnersToEmit) {
+        const [updatedWallet] = await db.select().from(wallets).where(eq(wallets.userId, winner.userId)).limit(1);
+        if (updatedWallet) {
+          emitPaymentUpdate(winner.userId, {
+            status: "success",
+            amount: winner.prize,
+            available: Number(updatedWallet.balance),
+            note: "Draw Payout Winner"
+          });
+        }
+      }
+
+      // Emit new transactions for payouts to admins
+      for (const winner of winnersToEmit) {
+        const [newTxn] = await db.select().from(transactions).where(and(eq(transactions.userId, winner.userId), eq(transactions.type, "prize_payout"))).orderBy(desc(transactions.createdAt)).limit(1);
+        if (newTxn) {
+          const typeMapping: Record<string, string> = {
+            deposit: "Deposit",
+            withdrawal: "Withdrawal",
+            ticket_purchase: "TicketPurchase",
+            prize_payout: "PrizePayout",
+          };
+          const statusMapping: Record<string, string> = {
+            pending: "Pending",
+            success: "Success",
+            failed: "Failed",
+          };
+          const [user] = await db.select().from(users).where(eq(users.id, winner.userId)).limit(1);
+          emitAdminTransaction({
+            id: newTxn.id,
+            userName: user?.name || "Unknown User",
+            amount: newTxn.amount,
+            type: typeMapping[newTxn.type] || newTxn.type,
+            status: statusMapping[newTxn.status] || newTxn.status,
+            method: "Prize",
+            datetime: newTxn.createdAt || new Date(),
+          });
+        }
+      }
+
+      // Update admin stats
+      const stats = await db.select({
+        totalRevenue: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'ticket_purchase' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalDeposits: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'deposit' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalWithdrawals: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.type} = 'withdrawal' AND ${transactions.status} = 'success' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+        totalPending: sql<number>`COALESCE(SUM(CASE WHEN ${transactions.status} = 'pending' THEN ${transactions.amount}::numeric ELSE 0 END), 0)`,
+      }).from(transactions);
+
+      if (stats.length > 0) {
+        emitAdminStatsUpdate({
+          totalRevenue: Number(stats[0].totalRevenue) || 0,
+          totalDeposits: Number(stats[0].totalDeposits) || 0,
+          totalWithdrawals: Number(stats[0].totalWithdrawals) || 0,
+          totalPending: Number(stats[0].totalPending) || 0,
+        });
+      }
+    } catch (err: any) {
+      console.error("[Declare Result Socket Event Error]:", err.message);
+    }
 
     return res.status(200).json({ success: true, message: "Result declared and winners rewarded" });
   } catch (error: any) {

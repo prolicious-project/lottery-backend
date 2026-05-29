@@ -157,7 +157,8 @@ export const adminLogin = async (req: Request, res: Response) => {
         email: admins.email,
         passwordHash: admins.passwordHash,
         isActive: admins.isActive,
-        roleName: adminRoles.name,
+        role: admins.role,        // ✅ enum value: always 'admin'
+        roleName: adminRoles.name, // display name e.g. 'Super Admin'
         permissions: adminRoles.permissions,
       })
       .from(admins)
@@ -189,7 +190,8 @@ export const adminLogin = async (req: Request, res: Response) => {
     const token = jwt.sign(
       {
         id: admin.id,
-        role: admin.roleName,
+        role: admin.role,         // ✅ always 'admin' — adminOnly middleware checks this
+        roleName: admin.roleName, // display name for UI
         permissions: admin.permissions,
       },
       process.env.JWT_SECRET as string,
