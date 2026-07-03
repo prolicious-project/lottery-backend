@@ -1,12 +1,18 @@
+CREATE TYPE "public"."game_type_enum" AS ENUM('lottery', 'level');--> statement-breakpoint
 CREATE TYPE "public"."campaign_status" AS ENUM('draft', 'scheduled', 'sent', 'failed');--> statement-breakpoint
 CREATE TYPE "public"."draw_status" AS ENUM('draft', 'scheduled', 'live', 'completed', 'cancelled');--> statement-breakpoint
+CREATE TYPE "public"."entry_status" AS ENUM('active', 'paid');--> statement-breakpoint
 CREATE TYPE "public"."kyc_status" AS ENUM('not_submitted', 'pending', 'verified', 'rejected');--> statement-breakpoint
+CREATE TYPE "public"."pool_status" AS ENUM('filling', 'completed');--> statement-breakpoint
+CREATE TYPE "public"."user_role" AS ENUM('admin', 'user');--> statement-breakpoint
 CREATE TYPE "public"."user_status" AS ENUM('active', 'suspended', 'banned', 'pending_verification');--> statement-breakpoint
+CREATE TYPE "public"."withdrawal_status" AS ENUM('pending', 'success', 'failed');--> statement-breakpoint
 CREATE TYPE "public"."adjust_type" AS ENUM('add', 'deduct');--> statement-breakpoint
 CREATE TYPE "public"."notif_status" AS ENUM('sent', 'delivered', 'failed', 'opened');--> statement-breakpoint
 CREATE TYPE "public"."ticket_status" AS ENUM('active', 'used', 'expired', 'refunded');--> statement-breakpoint
 CREATE TYPE "public"."txn_status" AS ENUM('pending', 'success', 'failed', 'refunded');--> statement-breakpoint
 CREATE TYPE "public"."txn_type" AS ENUM('deposit', 'withdrawal', 'ticket_purchase', 'prize_payout', 'bonus_credit', 'referral_reward', 'manual_adjustment');--> statement-breakpoint
+CREATE TYPE "public"."payment_order_status" AS ENUM('pending', 'success', 'failed');--> statement-breakpoint
 CREATE TABLE "admin_roles" (
 	"id" serial PRIMARY KEY NOT NULL,
 	"name" varchar(100) NOT NULL,
@@ -30,7 +36,10 @@ CREATE TABLE "game_types" (
 	"description" text,
 	"icon" varchar(10),
 	"is_active" boolean DEFAULT true NOT NULL,
+	"entry_fee" numeric(10, 2) DEFAULT '0' NOT NULL,
+	"commission_rate" numeric(5, 2) DEFAULT '0.10' NOT NULL,
 	"created_at" timestamp DEFAULT now(),
+	"type" "game_type_enum" NOT NULL,
 	CONSTRAINT "game_types_name_unique" UNIQUE("name")
 );
 --> statement-breakpoint
@@ -89,6 +98,7 @@ CREATE TABLE "admins" (
 	"name" varchar(200) NOT NULL,
 	"email" varchar(255) NOT NULL,
 	"password_hash" varchar(255) NOT NULL,
+	"role" "user_role" DEFAULT 'admin' NOT NULL,
 	"is_active" boolean DEFAULT true NOT NULL,
 	"last_login_at" timestamp,
 	"created_at" timestamp DEFAULT now(),
@@ -106,6 +116,8 @@ CREATE TABLE "draws" (
 	"current_entries" integer DEFAULT 0 NOT NULL,
 	"status" "draw_status" DEFAULT 'draft' NOT NULL,
 	"draw_date" timestamp NOT NULL,
+	"draw_start_date" timestamp NOT NULL,
+	"draw_end_date" timestamp NOT NULL,
 	"description" text,
 	"rng_seed_hash" varchar(124),
 	"is_guaranteed" boolean DEFAULT true NOT NULL,
@@ -125,6 +137,27 @@ CREATE TABLE "kyc_submissions" (
 	"status" "kyc_status" DEFAULT 'pending' NOT NULL,
 	"submitted_at" timestamp DEFAULT now(),
 	"reviewed_at" timestamp
+);
+--> statement-breakpoint
+CREATE TABLE "level_entries" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"user_id" uuid NOT NULL,
+	"game_type_id" integer NOT NULL,
+	"pool_id" uuid NOT NULL,
+	"level" integer NOT NULL,
+	"amount_paid" numeric(10, 2) NOT NULL,
+	"status" "entry_status" DEFAULT 'active' NOT NULL,
+	"created_at" timestamp DEFAULT now()
+);
+--> statement-breakpoint
+CREATE TABLE "level_pools" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"game_type_id" integer NOT NULL,
+	"level" integer NOT NULL,
+	"required_count" integer NOT NULL,
+	"current_count" integer DEFAULT 0 NOT NULL,
+	"status" "pool_status" DEFAULT 'filling' NOT NULL,
+	"created_at" timestamp DEFAULT now()
 );
 --> statement-breakpoint
 CREATE TABLE "notification_campaigns" (
@@ -164,6 +197,7 @@ CREATE TABLE "users" (
 	"phone" varchar(20) NOT NULL,
 	"password_hash" varchar(255) NOT NULL,
 	"avatar_url" text,
+	"role" "user_role" DEFAULT 'user' NOT NULL,
 	"points" integer DEFAULT 0 NOT NULL,
 	"total_points" integer DEFAULT 0 NOT NULL,
 	"status" "user_status" DEFAULT 'active' NOT NULL,
@@ -188,6 +222,15 @@ CREATE TABLE "wallets" (
 	"currency" varchar(5) DEFAULT 'INR' NOT NULL,
 	"updated_at" timestamp DEFAULT now(),
 	CONSTRAINT "wallets_user_id_unique" UNIQUE("user_id")
+);
+--> statement-breakpoint
+CREATE TABLE "withdrawals" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"user_id" uuid NOT NULL,
+	"amount" numeric(12, 2) NOT NULL,
+	"status" "withdrawal_status" DEFAULT 'pending' NOT NULL,
+	"upi_id" varchar(100),
+	"created_at" timestamp DEFAULT now()
 );
 --> statement-breakpoint
 CREATE TABLE "admin_ip_whitelist" (
@@ -346,8 +389,7 @@ CREATE TABLE "tickets" (
 	"is_auto_pick" boolean DEFAULT false NOT NULL,
 	"status" "ticket_status" DEFAULT 'active' NOT NULL,
 	"is_winner" boolean DEFAULT false NOT NULL,
-	"purchased_at" timestamp DEFAULT now(),
-	CONSTRAINT "tickets_ticket_number_unique" UNIQUE("ticket_number")
+	"purchased_at" timestamp DEFAULT now()
 );
 --> statement-breakpoint
 CREATE TABLE "transactions" (
@@ -388,17 +430,42 @@ CREATE TABLE "wallet_adjustments" (
 	"created_at" timestamp DEFAULT now()
 );
 --> statement-breakpoint
+CREATE TABLE "payment_orders" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"user_id" uuid NOT NULL,
+	"amount" integer NOT NULL,
+	"razorpay_order_id" varchar(100) NOT NULL,
+	"status" "payment_order_status" DEFAULT 'pending' NOT NULL,
+	"created_at" timestamp DEFAULT now(),
+	CONSTRAINT "payment_orders_razorpay_order_id_unique" UNIQUE("razorpay_order_id")
+);
+--> statement-breakpoint
+CREATE TABLE "user_bank_accounts" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"user_id" uuid NOT NULL,
+	"account_number" varchar(25) NOT NULL,
+	"ifsc" varchar(15) NOT NULL,
+	"upi_id" varchar(100),
+	"is_verified" boolean DEFAULT false NOT NULL,
+	"created_at" timestamp DEFAULT now()
+);
+--> statement-breakpoint
 ALTER TABLE "admins" ADD CONSTRAINT "admins_role_id_admin_roles_id_fk" FOREIGN KEY ("role_id") REFERENCES "public"."admin_roles"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "draws" ADD CONSTRAINT "draws_game_type_id_game_types_id_fk" FOREIGN KEY ("game_type_id") REFERENCES "public"."game_types"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "draws" ADD CONSTRAINT "draws_created_by_admins_id_fk" FOREIGN KEY ("created_by") REFERENCES "public"."admins"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "kyc_submissions" ADD CONSTRAINT "kyc_submissions_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "kyc_submissions" ADD CONSTRAINT "kyc_submissions_doc_type_id_kyc_document_types_id_fk" FOREIGN KEY ("doc_type_id") REFERENCES "public"."kyc_document_types"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "level_entries" ADD CONSTRAINT "level_entries_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "level_entries" ADD CONSTRAINT "level_entries_game_type_id_game_types_id_fk" FOREIGN KEY ("game_type_id") REFERENCES "public"."game_types"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "level_entries" ADD CONSTRAINT "level_entries_pool_id_level_pools_id_fk" FOREIGN KEY ("pool_id") REFERENCES "public"."level_pools"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "level_pools" ADD CONSTRAINT "level_pools_game_type_id_game_types_id_fk" FOREIGN KEY ("game_type_id") REFERENCES "public"."game_types"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "notification_campaigns" ADD CONSTRAINT "notification_campaigns_admin_id_admins_id_fk" FOREIGN KEY ("admin_id") REFERENCES "public"."admins"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "notification_campaigns" ADD CONSTRAINT "notification_campaigns_template_id_notification_templates_id_fk" FOREIGN KEY ("template_id") REFERENCES "public"."notification_templates"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "referral_codes" ADD CONSTRAINT "referral_codes_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "users" ADD CONSTRAINT "users_level_id_levels_id_fk" FOREIGN KEY ("level_id") REFERENCES "public"."levels"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "users" ADD CONSTRAINT "users_country_id_countries_id_fk" FOREIGN KEY ("country_id") REFERENCES "public"."countries"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "wallets" ADD CONSTRAINT "wallets_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "withdrawals" ADD CONSTRAINT "withdrawals_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "admin_ip_whitelist" ADD CONSTRAINT "admin_ip_whitelist_admin_id_admins_id_fk" FOREIGN KEY ("admin_id") REFERENCES "public"."admins"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "campaign_channels" ADD CONSTRAINT "campaign_channels_campaign_id_notification_campaigns_id_fk" FOREIGN KEY ("campaign_id") REFERENCES "public"."notification_campaigns"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "draw_eligible_levels" ADD CONSTRAINT "draw_eligible_levels_draw_id_draws_id_fk" FOREIGN KEY ("draw_id") REFERENCES "public"."draws"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
@@ -434,6 +501,8 @@ ALTER TABLE "user_sessions" ADD CONSTRAINT "user_sessions_user_id_users_id_fk" F
 ALTER TABLE "wallet_adjustments" ADD CONSTRAINT "wallet_adjustments_wallet_id_wallets_id_fk" FOREIGN KEY ("wallet_id") REFERENCES "public"."wallets"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "wallet_adjustments" ADD CONSTRAINT "wallet_adjustments_admin_id_admins_id_fk" FOREIGN KEY ("admin_id") REFERENCES "public"."admins"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "wallet_adjustments" ADD CONSTRAINT "wallet_adjustments_txn_id_transactions_id_fk" FOREIGN KEY ("txn_id") REFERENCES "public"."transactions"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "payment_orders" ADD CONSTRAINT "payment_orders_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "user_bank_accounts" ADD CONSTRAINT "user_bank_accounts_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "draws_status_idx" ON "draws" USING btree ("status");--> statement-breakpoint
 CREATE INDEX "draws_date_idx" ON "draws" USING btree ("draw_date");--> statement-breakpoint
 CREATE INDEX "referral_codes_code_idx" ON "referral_codes" USING btree ("code");--> statement-breakpoint
@@ -449,8 +518,14 @@ CREATE INDEX "referrals_referrer_idx" ON "referrals" USING btree ("referrer_user
 CREATE INDEX "tickets_user_draw_idx" ON "tickets" USING btree ("user_id","draw_id");--> statement-breakpoint
 CREATE INDEX "tickets_draw_idx" ON "tickets" USING btree ("draw_id");--> statement-breakpoint
 CREATE INDEX "tickets_number_idx" ON "tickets" USING btree ("ticket_number");--> statement-breakpoint
+CREATE UNIQUE INDEX "tickets_user_draw_ticket_idx" ON "tickets" USING btree ("draw_id","ticket_number");--> statement-breakpoint
 CREATE INDEX "txns_user_created_idx" ON "transactions" USING btree ("user_id","created_at");--> statement-breakpoint
 CREATE INDEX "txns_status_idx" ON "transactions" USING btree ("status");--> statement-breakpoint
 CREATE INDEX "txns_created_at_idx" ON "transactions" USING btree ("created_at");--> statement-breakpoint
 CREATE INDEX "sessions_token_idx" ON "user_sessions" USING btree ("token");--> statement-breakpoint
-CREATE INDEX "sessions_user_idx" ON "user_sessions" USING btree ("user_id");
+CREATE INDEX "sessions_user_idx" ON "user_sessions" USING btree ("user_id");--> statement-breakpoint
+CREATE INDEX "payment_orders_user_idx" ON "payment_orders" USING btree ("user_id");--> statement-breakpoint
+CREATE INDEX "payment_orders_rzp_order_idx" ON "payment_orders" USING btree ("razorpay_order_id");--> statement-breakpoint
+CREATE INDEX "payment_orders_status_idx" ON "payment_orders" USING btree ("status");--> statement-breakpoint
+CREATE INDEX "user_bank_accounts_user_idx" ON "user_bank_accounts" USING btree ("user_id");--> statement-breakpoint
+CREATE INDEX "user_bank_accounts_verified_idx" ON "user_bank_accounts" USING btree ("user_id","is_verified");
