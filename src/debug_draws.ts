@@ -5,6 +5,7 @@ import { eq, desc } from "drizzle-orm";
 async function debug() {
   try {
     console.log("Testing DB connection and query...");
+    console.log("Fetching all draws with game type names...");
     
     const page = 1;
     const limit = 10;
